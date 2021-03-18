@@ -35,6 +35,7 @@ import (
 	crypto "github.com/libp2p/go-libp2p-crypto"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/multiformats/go-multiaddr"
+	"golang.org/x/xerrors"
 
 	cli "github.com/urfave/cli/v2"
 )
@@ -129,8 +130,10 @@ type NiftyStatus struct {
 	Failure                 string
 	FetchFailure            string
 	MetaDataOnIpfs          bool
+	AssetOnIpfs             bool
 	AvailableAfterHttpFetch bool
 	OutputHash              string
+	AssetUrl                string
 }
 
 type tokenInput struct {
@@ -153,8 +156,17 @@ func parseInputFile(fname string) ([]*NiftyInfo, error) {
 	defer fi.Close()
 
 	var inps []inputData
-	if err := json.NewDecoder(fi).Decode(&inps); err != nil {
-		return nil, err
+	dec := json.NewDecoder(fi)
+	for {
+		var inp inputData
+		if err := dec.Decode(&inp); err != nil {
+			if xerrors.Is(err, io.EOF) {
+				break
+			}
+			return nil, err
+		}
+		fmt.Println("parsed: ", inp.ContractName)
+		inps = append(inps, inp)
 	}
 
 	var out []*NiftyInfo
@@ -236,7 +248,7 @@ var fetchCmd = &cli.Command{
 					<-sema
 				}()
 
-				fmt.Println("fetching: ", n.IpfsHash)
+				fmt.Println("fetching: ", n.URI)
 				resp, err := nd.processNifty(context.TODO(), n)
 				if err != nil {
 					fmt.Println("Process error: ", err)
@@ -249,40 +261,64 @@ var fetchCmd = &cli.Command{
 
 		wg.Wait()
 
-		return writeOutput("nifty-results.csv", nifties, out)
+		fi, err := os.Create("nifty-results.csv")
+		if err != nil {
+			return err
+		}
+		defer fi.Close()
+
+		w := csv.NewWriter(fi)
+		defer w.Flush()
+
+		if err := writeOutputHeader(w); err != nil {
+			return err
+		}
+		for i, n := range nifties {
+			if err := writeNiftyStatusOut(w, n, out[i]); err != nil {
+				return err
+			}
+		}
+
+		return nil
 	},
 }
 
-func writeOutput(fname string, nifties []*NiftyInfo, out []*NiftyStatus) error {
-	fi, err := os.Create(fname)
-	if err != nil {
-		return err
-	}
-	defer fi.Close()
+func writeOutputHeader(w *csv.Writer) error {
+	return w.Write([]string{
+		"Contract",
+		"IpfsHash",
+		"Org",
+		"URI",
+		"TokenID",
+		"OutputHash",
+		"AssetUrl",
+		"NumProviders",
+		"DataOnIpfs",
+		"DataAvailableAfterHttpFetch",
+		"MetaDataOnIpfs",
+		"AssetOnIpfs",
+		"Failure",
+		"IpfsGetFailure",
+	})
+}
 
-	w := csv.NewWriter(fi)
-	defer w.Flush()
-
-	for i := range nifties {
-		n := nifties[i]
-		r := out[i]
-		w.Write([]string{
-			n.Contract,
-			n.IpfsHash,
-			n.Org,
-			n.URI,
-			n.TokenID,
-			r.OutputHash,
-			fmt.Sprint(len(r.Providers)),
-			fmt.Sprint(r.HaveData),
-			fmt.Sprint(r.AvailableAfterHttpFetch),
-			fmt.Sprint(r.MetaDataOnIpfs),
-			r.Failure,
-			r.FetchFailure,
-		})
-	}
-
-	return nil
+func writeNiftyStatusOut(w *csv.Writer, n *NiftyInfo, r *NiftyStatus) error {
+	return w.Write([]string{
+		n.Contract,
+		n.IpfsHash,
+		n.Org,
+		n.URI,
+		n.TokenID,
+		r.OutputHash,
+		r.AssetUrl,
+		fmt.Sprint(len(r.Providers)),
+		fmt.Sprint(r.HaveData),
+		fmt.Sprint(r.AvailableAfterHttpFetch),
+		fmt.Sprint(r.MetaDataOnIpfs),
+		fmt.Sprint(r.AssetOnIpfs),
+		r.Failure,
+		r.FetchFailure,
+	})
 }
 
 func (nd *Node) processNifty(ctx context.Context, nft *NiftyInfo) (*NiftyStatus, error) {
@@ -363,13 +399,15 @@ func (nd *Node) fetchNiftyStatus(ctx context.Context, nft *NiftyInfo) (*NiftySta
 		st.HaveData = have
 	}
 
+	st.MetaDataOnIpfs = strings.Contains(nft.URI, "ipfs")
 	meta, err := fetchMeta(nft.URI)
 	if err != nil {
 		st.Failure = fmt.Sprintf("failed to fetch meta: %s", err)
 		return st, nil
 	}
 
-	st.MetaDataOnIpfs = strings.Contains(nft.URI, "/ipfs/")
+	st.AssetOnIpfs = strings.Contains(meta.Image, "ipfs")
+	st.AssetUrl = meta.Image
 
 	datacid, err := nd.fetchNftData(meta.Image)
 	if err != nil {
@@ -379,7 +417,7 @@ func (nd *Node) fetchNiftyStatus(ctx context.Context, nft *NiftyInfo) (*NiftySta
 
 	st.OutputHash = datacid.String()
 
-	if datacid.String() != nft.IpfsHash {
+	if nft.IpfsHash != "" && datacid.String() != nft.IpfsHash {
 		st.Failure = "ipfs hash of fetched data doesnt match"
 	} else {
 		st.AvailableAfterHttpFetch = true
@@ -389,6 +427,10 @@ func (nd *Node) fetchNiftyStatus(ctx context.Context, nft *NiftyInfo) (*NiftySta
 }
 
 func (nd *Node) fetchNftData(url string) (cid.Cid, error) {
+	if strings.HasPrefix(url, "ipfs://") {
+		url = "https://ipfs.io" + url[6:]
+	}
+
 	resp, err := http.Get(url)
 	if err != nil {
 		return cid.Undef, err
@@ -406,6 +448,10 @@ func (nd *Node) fetchNftData(url string) (cid.Cid, error) {
 }
 
 func fetchMeta(url string) (*niftyMeta, error) {
+	if strings.HasPrefix(url, "ipfs://") {
+		url = "https://ipfs.io" + url[6:]
+	}
+
 	resp, err := http.Get(url)
 	if err != nil {
 		return nil, err
@@ -414,6 +460,8 @@ func fetchMeta(url string) (*niftyMeta, error) {
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("metadata fetch request failed: %d %s", resp.StatusCode, resp.Status)
 	}
+
+	defer resp.Body.Close()
 
 	var meta niftyMeta
 	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
