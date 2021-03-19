@@ -200,6 +200,9 @@ var fetchCmd = &cli.Command{
 			Usage: "specify fetching parallelism",
 			Value: 64,
 		},
+		&cli.BoolFlag{
+			Name: "skip-ipfs-fetch",
+		},
 	},
 	Action: func(cctx *cli.Context) error {
 		fmt.Println("parsing input...")
@@ -213,6 +216,8 @@ var fetchCmd = &cli.Command{
 		if err != nil {
 			return err
 		}
+
+		nd.SkipIpfsFetch = cctx.Bool("skip-ipfs-fetch")
 
 		for _, a := range nd.Host.Addrs() {
 			fmt.Printf("%s/p2p/%s\n", a, nd.Host.ID())
@@ -350,6 +355,10 @@ type niftyMeta struct {
 }
 
 func (nd *Node) fetchIpfsData(ctx context.Context, ipfs string) ([]peer.ID, bool, error) {
+	if nd.SkipIpfsFetch {
+		return nil, false, nil
+	}
+
 	out, err := nd.memo.Do(ctx, ipfs)
 	if err != nil {
 		return nil, false, err
@@ -423,10 +432,10 @@ func (nd *Node) fetchNiftyStatus(ctx context.Context, nft *NiftyInfo) (*NiftySta
 		return st, nil
 	}
 
-	st.OutputHash = cf.outputCid.String()
-	st.ImageSize = cf.size
+	st.OutputHash = cf.OutputCid.String()
+	st.ImageSize = cf.Size
 
-	if nft.IpfsHash != "" && cf.outputCid.String() != nft.IpfsHash {
+	if nft.IpfsHash != "" && cf.OutputCid.String() != nft.IpfsHash {
 		st.Failure = "ipfs hash of fetched data doesnt match"
 	} else {
 		st.AvailableAfterHttpFetch = true
@@ -455,7 +464,48 @@ func (nd *Node) fetchNftData(ctx context.Context, url string) (*contentFetch, er
 	return cf.(*contentFetch), nil
 }
 
+func (nd *Node) checkUrlCache(url string) (*contentFetch, error) {
+	label := urlToPath(url)
+	p := filepath.Join(nd.MetaCacheDir, label)
+
+	data, err := ioutil.ReadFile(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+
+		return nil, err
+	}
+
+	var cf contentFetch
+	if err := json.Unmarshal(data, &cf); err != nil {
+		return nil, err
+	}
+
+	return &cf, nil
+}
+
+func (nd *Node) putUrlCache(url string, cf *contentFetch) error {
+	label := urlToPath(url)
+	p := filepath.Join(nd.MetaCacheDir, label)
+	data, err := json.Marshal(cf)
+	if err != nil {
+		return err
+	}
+
+	return ioutil.WriteFile(p, data, 0660)
+}
+
 func (nd *Node) doFetchData(ctx context.Context, url string) (interface{}, error) {
+	cached, err := nd.checkUrlCache(url)
+	if err != nil {
+		return nil, err
+	}
+	if cached != nil {
+		return cached, nil
+	}
+
+	origUrl := url
 	if strings.HasPrefix(url, "ipfs://") {
 		if strings.Contains(url, "/ipfs/") {
 			// incorrectly formatted ipfs uri...
@@ -480,10 +530,16 @@ func (nd *Node) doFetchData(ctx context.Context, url string) (interface{}, error
 		return nil, err
 	}
 
-	return &contentFetch{
-		size:      rc.count,
-		outputCid: ind.Cid(),
-	}, nil
+	cf := &contentFetch{
+		Size:      rc.count,
+		OutputCid: ind.Cid(),
+	}
+
+	if err := nd.putUrlCache(origUrl, cf); err != nil {
+		fmt.Println("failed to cache contentFetch: ", err)
+	}
+
+	return cf, nil
 }
 
 func (nft *NiftyInfo) label() string {
@@ -556,8 +612,8 @@ type activeSearch struct {
 }
 
 type contentFetch struct {
-	size      int64
-	outputCid cid.Cid
+	Size      int64
+	OutputCid cid.Cid
 }
 
 type Node struct {
@@ -570,7 +626,8 @@ type Node struct {
 	Bitswap    *bitswap.Bitswap
 	Dag        ipld.DAGService
 
-	MetaCacheDir string
+	SkipIpfsFetch bool
+	MetaCacheDir  string
 
 	memo *memo.Memoizer
 
