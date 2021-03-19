@@ -10,6 +10,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -187,6 +188,12 @@ func parseInputFile(fname string) ([]*NiftyInfo, error) {
 
 var fetchCmd = &cli.Command{
 	Name: "fetch",
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:  "dir",
+			Value: ".",
+		},
+	},
 	Action: func(cctx *cli.Context) error {
 		fmt.Println("parsing input...")
 		nifties, err := parseInputFile(cctx.Args().First())
@@ -195,7 +202,7 @@ var fetchCmd = &cli.Command{
 		}
 
 		fmt.Println("setting up node...")
-		nd, err := setup(context.TODO())
+		nd, err := setup(context.TODO(), cctx.String("dir"))
 		if err != nil {
 			return err
 		}
@@ -463,8 +470,26 @@ func (nd *Node) fetchMeta(nft *NiftyInfo) (*niftyMeta, error) {
 		wait: make(chan struct{}),
 	}
 	nd.metaMemo[nft.label()] = f
-
 	nd.metaLk.Unlock()
+	defer func() {
+		close(f.wait)
+	}()
+
+	cachePath := filepath.Join(nd.MetaCacheDir, nft.label())
+	data, err := ioutil.ReadFile(cachePath)
+	if err == nil {
+		var m niftyMeta
+		if err := json.Unmarshal(data, &m); err != nil {
+			return nil, err
+		}
+		f.meta = &m
+		return f.meta, nil
+	}
+	if !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	url := nft.URI
 
 	if strings.HasPrefix(url, "ipfs://") {
 		url = "https://ipfs.io" + url[6:]
@@ -472,18 +497,32 @@ func (nd *Node) fetchMeta(nft *NiftyInfo) (*niftyMeta, error) {
 
 	resp, err := http.Get(url)
 	if err != nil {
+		f.err = err
 		return nil, err
 	}
 
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("metadata fetch request failed: %d %s", resp.StatusCode, resp.Status)
+		err := fmt.Errorf("metadata fetch request failed: %d %s", resp.StatusCode, resp.Status)
+		f.err = err
+		return nil, err
 	}
 
 	defer resp.Body.Close()
 
 	var meta niftyMeta
 	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
+		f.err = err
 		return nil, err
+	}
+
+	outdata, err := json.Marshal(meta)
+	if err != nil {
+		return nil, err
+	}
+
+	fmt.Println("meta: ", cachePath, string(outdata))
+	if err := ioutil.WriteFile(cachePath, outdata, 0660); err != nil {
+		fmt.Println("caching meta result failed: ", err)
 	}
 
 	return &meta, nil
@@ -546,8 +585,8 @@ func loadOrInitPeerKey(kf string) (crypto.PrivKey, error) {
 	return crypto.UnmarshalPrivateKey(data)
 }
 
-func setup(ctx context.Context) (*Node, error) {
-	peerkey, err := loadOrInitPeerKey("niftyscrape.libp2p.key")
+func setup(ctx context.Context, rootdir string) (*Node, error) {
+	peerkey, err := loadOrInitPeerKey(filepath.Join(rootdir, "niftyscrape.libp2p.key"))
 	if err != nil {
 		return nil, err
 	}
@@ -555,7 +594,7 @@ func setup(ctx context.Context) (*Node, error) {
 	h, err := libp2p.New(ctx,
 		//libp2p.ListenAddrStrings(cfg.ListenAddrs...),
 		libp2p.NATPortMap(),
-		libp2p.ConnectionManager(connmgr.NewConnManager(500, 800, time.Minute)),
+		libp2p.ConnectionManager(connmgr.NewConnManager(300, 500, time.Second*15)),
 		libp2p.Identity(peerkey),
 	)
 	if err != nil {
@@ -568,7 +607,7 @@ func setup(ctx context.Context) (*Node, error) {
 	}
 
 	bstore, err := lmdb.Open(&lmdb.Options{
-		Path: "allthedata",
+		Path: filepath.Join(rootdir, "allthedata"),
 	})
 	if err != nil {
 		return nil, err
@@ -579,12 +618,20 @@ func setup(ctx context.Context) (*Node, error) {
 
 	bserv := blockservice.New(bstore, bswap)
 	ds := merkledag.NewDAGService(bserv)
+
+	dir := filepath.Join(rootdir, "metadatas")
+	if err := os.MkdirAll(dir, 0775); err != nil {
+		return nil, err
+	}
+
 	return &Node{
-		Dht:        dht,
-		Host:       h,
-		Blockstore: bstore,
-		Bitswap:    bswap.(*bitswap.Bitswap),
-		Dag:        ds,
-		memo:       make(map[cid.Cid]*activeSearch),
+		MetaCacheDir: dir,
+		Dht:          dht,
+		Host:         h,
+		Blockstore:   bstore,
+		Bitswap:      bswap.(*bitswap.Bitswap),
+		Dag:          ds,
+		memo:         make(map[cid.Cid]*activeSearch),
+		metaMemo:     make(map[string]*metaFetch),
 	}, nil
 }
