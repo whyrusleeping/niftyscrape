@@ -400,7 +400,7 @@ func (nd *Node) fetchNiftyStatus(ctx context.Context, nft *NiftyInfo) (*NiftySta
 	}
 
 	st.MetaDataOnIpfs = strings.Contains(nft.URI, "ipfs")
-	meta, err := fetchMeta(nft.URI)
+	meta, err := nd.fetchMeta(nft)
 	if err != nil {
 		st.Failure = fmt.Sprintf("failed to fetch meta: %s", err)
 		return st, nil
@@ -447,7 +447,25 @@ func (nd *Node) fetchNftData(url string) (cid.Cid, error) {
 	return ind.Cid(), nil
 }
 
-func fetchMeta(url string) (*niftyMeta, error) {
+func (nft *NiftyInfo) label() string {
+	return nft.Contract + nft.TokenID
+}
+
+func (nd *Node) fetchMeta(nft *NiftyInfo) (*niftyMeta, error) {
+	nd.metaLk.Lock()
+	f, ok := nd.metaMemo[nft.label()]
+	if ok {
+		nd.metaLk.Unlock()
+		<-f.wait
+		return f.meta, f.err
+	}
+	f = &metaFetch{
+		wait: make(chan struct{}),
+	}
+	nd.metaMemo[nft.label()] = f
+
+	nd.metaLk.Unlock()
+
 	if strings.HasPrefix(url, "ipfs://") {
 		url = "https://ipfs.io" + url[6:]
 	}
@@ -477,6 +495,12 @@ type activeSearch struct {
 	err    error
 }
 
+type metaFetch struct {
+	wait chan struct{}
+	err  error
+	meta *niftyMeta
+}
+
 type Node struct {
 	Dht  *dht.IpfsDHT
 	Host host.Host
@@ -487,8 +511,13 @@ type Node struct {
 	Bitswap    *bitswap.Bitswap
 	Dag        ipld.DAGService
 
+	MetaCacheDir string
+
 	memoLk sync.Mutex
 	memo   map[cid.Cid]*activeSearch
+
+	metaLk   sync.Mutex
+	metaMemo map[string]*metaFetch
 }
 
 func loadOrInitPeerKey(kf string) (crypto.PrivKey, error) {
