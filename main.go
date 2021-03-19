@@ -466,7 +466,7 @@ func (nd *Node) fetchNftData(ctx context.Context, url string) (*contentFetch, er
 
 func (nd *Node) checkUrlCache(url string) (*contentFetch, error) {
 	label := urlToPath(url)
-	p := filepath.Join(nd.MetaCacheDir, label)
+	p := filepath.Join(nd.ContentFetchDir, label)
 
 	data, err := ioutil.ReadFile(p)
 	if err != nil {
@@ -487,7 +487,7 @@ func (nd *Node) checkUrlCache(url string) (*contentFetch, error) {
 
 func (nd *Node) putUrlCache(url string, cf *contentFetch) error {
 	label := urlToPath(url)
-	p := filepath.Join(nd.MetaCacheDir, label)
+	p := filepath.Join(nd.ContentFetchDir, label)
 	data, err := json.Marshal(cf)
 	if err != nil {
 		return err
@@ -626,8 +626,9 @@ type Node struct {
 	Bitswap    *bitswap.Bitswap
 	Dag        ipld.DAGService
 
-	SkipIpfsFetch bool
-	MetaCacheDir  string
+	SkipIpfsFetch   bool
+	MetaCacheDir    string
+	ContentFetchDir string
 
 	memo *memo.Memoizer
 
@@ -701,13 +702,19 @@ func setup(ctx context.Context, rootdir string) (*Node, error) {
 		return nil, err
 	}
 
+	cfdir := filepath.Join(rootdir, "cfdir")
+	if err := os.MkdirAll(cfdir, 0775); err != nil {
+		return nil, err
+	}
+
 	nd := &Node{
-		MetaCacheDir: dir,
-		Dht:          dht,
-		Host:         h,
-		Blockstore:   bstore,
-		Bitswap:      bswap.(*bitswap.Bitswap),
-		Dag:          ds,
+		MetaCacheDir:    dir,
+		ContentFetchDir: cfdir,
+		Dht:             dht,
+		Host:            h,
+		Blockstore:      bstore,
+		Bitswap:         bswap.(*bitswap.Bitswap),
+		Dag:             ds,
 	}
 
 	nd.memo = memo.NewMemoizer(nd.doIpfsFetch)
