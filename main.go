@@ -193,6 +193,11 @@ var fetchCmd = &cli.Command{
 			Name:  "dir",
 			Value: ".",
 		},
+		&cli.IntFlag{
+			Name:  "parallel",
+			Usage: "specify fetching parallelism",
+			Value: 64,
+		},
 	},
 	Action: func(cctx *cli.Context) error {
 		fmt.Println("parsing input...")
@@ -236,7 +241,7 @@ var fetchCmd = &cli.Command{
 			fmt.Println("dht bootstrapping failed: ", err)
 		}
 
-		sema := make(chan struct{}, 64)
+		sema := make(chan struct{}, cctx.Int("parallel"))
 		out := make([]*NiftyStatus, len(nifties))
 		fmt.Println("fetching nifties now!")
 		bar := pb.New(len(nifties)).Start()
@@ -344,31 +349,26 @@ func (nd *Node) fetchIpfsData(ctx context.Context, ipfs string) ([]peer.ID, bool
 	if err != nil {
 		return nil, false, err
 	}
-	/*
 
-		nd.memoLk.Lock()
-		mem, ok := nd.memo[ipfshash]
-		if ok {
-			nd.memoLk.Unlock()
-			<-mem.wait
-			if mem.err != nil {
-				return nil, mem.err
-			}
-			return mem.status, nil
-		}
-		mem = &activeSearch{
-			wait: make(chan struct{}),
-		}
-		nd.memo[ipfshash] = mem
+	nd.memoLk.Lock()
+	mem, ok := nd.memo[ipfshash]
+	if ok {
 		nd.memoLk.Unlock()
+		<-mem.wait
+		if mem.err != nil {
+			return nil, false, mem.err
+		}
+		return mem.provs, mem.have, nil
+	}
+	mem = &activeSearch{
+		wait: make(chan struct{}),
+	}
+	nd.memo[ipfshash] = mem
+	nd.memoLk.Unlock()
 
-		st := &NiftyStatus{}
-		mem.status = st
-
-		defer func() {
-			close(mem.wait)
-		}()
-	*/
+	defer func() {
+		close(mem.wait)
+	}()
 
 	pctx, cancel := context.WithTimeout(ctx, time.Second*10)
 	defer cancel()
@@ -383,6 +383,8 @@ func (nd *Node) fetchIpfsData(ctx context.Context, ipfs string) ([]peer.ID, bool
 		provids = append(provids, p.ID)
 	}
 
+	mem.provs = provids
+
 	nctx, cancel := context.WithTimeout(ctx, time.Second*30)
 	defer cancel()
 
@@ -391,6 +393,7 @@ func (nd *Node) fetchIpfsData(ctx context.Context, ipfs string) ([]peer.ID, bool
 		return provids, false, nil
 	}
 
+	mem.have = true
 	return provids, true, nil
 }
 
@@ -529,9 +532,10 @@ func (nd *Node) fetchMeta(nft *NiftyInfo) (*niftyMeta, error) {
 }
 
 type activeSearch struct {
-	wait   chan struct{}
-	status *NiftyStatus
-	err    error
+	wait  chan struct{}
+	provs []peer.ID
+	have  bool
+	err   error
 }
 
 type metaFetch struct {
