@@ -32,6 +32,7 @@ require (
 	github.com/onsi/ginkgo v1.14.0 // indirect
 	github.com/stretchr/testify v1.7.0 // indirect
 	github.com/urfave/cli/v2 v2.3.0
+	github.com/whyrusleeping/memo v0.0.0-20210319195245-3580310a3e37
 	go.opencensus.io v0.22.5 // indirect
 	go.uber.org/multierr v1.6.0 // indirect
 	golang.org/x/net v0.0.0-20210316092652-d523dce5a7f4 // indirect

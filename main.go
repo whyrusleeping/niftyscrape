@@ -36,6 +36,7 @@ import (
 	crypto "github.com/libp2p/go-libp2p-crypto"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/multiformats/go-multiaddr"
+	memo "github.com/whyrusleeping/memo"
 	"golang.org/x/xerrors"
 
 	cli "github.com/urfave/cli/v2"
@@ -134,6 +135,7 @@ type NiftyStatus struct {
 	AssetOnIpfs             bool
 	AvailableAfterHttpFetch bool
 	OutputHash              string
+	ImageSize               int64
 	AssetUrl                string
 }
 
@@ -303,6 +305,7 @@ func writeOutputHeader(w *csv.Writer) error {
 		"URI",
 		"TokenID",
 		"OutputHash",
+		"ImageSize",
 		"AssetUrl",
 		"NumProviders",
 		"DataOnIpfs",
@@ -322,6 +325,7 @@ func writeNiftyStatusOut(w *csv.Writer, n *NiftyInfo, r *NiftyStatus) error {
 		n.URI,
 		n.TokenID,
 		r.OutputHash,
+		fmt.Sprint(r.ImageSize),
 		r.AssetUrl,
 		fmt.Sprint(len(r.Providers)),
 		fmt.Sprint(r.HaveData),
@@ -338,44 +342,36 @@ func (nd *Node) processNifty(ctx context.Context, nft *NiftyInfo) (*NiftyStatus,
 }
 
 type niftyMeta struct {
-	Description string
-	ExternalUrl string `json:"external_url"`
-	Image       string
-	Name        string
+	Description  string
+	ExternalUrl  string `json:"external_url"`
+	Image        string
+	Name         string
+	AnimationUrl string `json:"animation_url"`
 }
 
 func (nd *Node) fetchIpfsData(ctx context.Context, ipfs string) ([]peer.ID, bool, error) {
-	ipfshash, err := cid.Decode(ipfs)
+	out, err := nd.memo.Do(ctx, ipfs)
 	if err != nil {
 		return nil, false, err
 	}
 
-	nd.memoLk.Lock()
-	mem, ok := nd.memo[ipfshash]
-	if ok {
-		nd.memoLk.Unlock()
-		<-mem.wait
-		if mem.err != nil {
-			return nil, false, mem.err
-		}
-		return mem.provs, mem.have, nil
-	}
-	mem = &activeSearch{
-		wait: make(chan struct{}),
-	}
-	nd.memo[ipfshash] = mem
-	nd.memoLk.Unlock()
+	res := out.(*activeSearch)
 
-	defer func() {
-		close(mem.wait)
-	}()
+	return res.provs, res.have, nil
+}
+
+func (nd *Node) doIpfsFetch(ctx context.Context, ipfs string) (interface{}, error) {
+	ipfshash, err := cid.Decode(ipfs)
+	if err != nil {
+		return nil, err
+	}
 
 	pctx, cancel := context.WithTimeout(ctx, time.Second*10)
 	defer cancel()
 
 	provs, err := nd.Dht.FindProviders(pctx, ipfshash)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 
 	var provids []peer.ID
@@ -383,18 +379,20 @@ func (nd *Node) fetchIpfsData(ctx context.Context, ipfs string) ([]peer.ID, bool
 		provids = append(provids, p.ID)
 	}
 
-	mem.provs = provids
-
 	nctx, cancel := context.WithTimeout(ctx, time.Second*30)
 	defer cancel()
 
 	err = merkledag.FetchGraph(nctx, ipfshash, nd.Dag)
 	if err != nil {
-		return provids, false, nil
+		return &activeSearch{
+			provs: provids,
+		}, nil
 	}
 
-	mem.have = true
-	return provids, true, nil
+	return &activeSearch{
+		provs: provids,
+		have:  true,
+	}, nil
 }
 
 func (nd *Node) fetchNiftyStatus(ctx context.Context, nft *NiftyInfo) (*NiftyStatus, error) {
@@ -410,7 +408,7 @@ func (nd *Node) fetchNiftyStatus(ctx context.Context, nft *NiftyInfo) (*NiftySta
 	}
 
 	st.MetaDataOnIpfs = strings.Contains(nft.URI, "ipfs")
-	meta, err := nd.fetchMeta(nft)
+	meta, err := nd.fetchMeta(ctx, nft)
 	if err != nil {
 		st.Failure = fmt.Sprintf("failed to fetch meta: %s", err)
 		return st, nil
@@ -419,15 +417,16 @@ func (nd *Node) fetchNiftyStatus(ctx context.Context, nft *NiftyInfo) (*NiftySta
 	st.AssetOnIpfs = strings.Contains(meta.Image, "ipfs")
 	st.AssetUrl = meta.Image
 
-	datacid, err := nd.fetchNftData(meta.Image)
+	cf, err := nd.fetchNftData(ctx, meta.Image)
 	if err != nil {
 		st.Failure = fmt.Sprintf("failed to fetch meta: %s", err)
 		return st, nil
 	}
 
-	st.OutputHash = datacid.String()
+	st.OutputHash = cf.outputCid.String()
+	st.ImageSize = cf.size
 
-	if nft.IpfsHash != "" && datacid.String() != nft.IpfsHash {
+	if nft.IpfsHash != "" && cf.outputCid.String() != nft.IpfsHash {
 		st.Failure = "ipfs hash of fetched data doesnt match"
 	} else {
 		st.AvailableAfterHttpFetch = true
@@ -436,63 +435,88 @@ func (nd *Node) fetchNiftyStatus(ctx context.Context, nft *NiftyInfo) (*NiftySta
 	return st, nil
 }
 
-func (nd *Node) fetchNftData(url string) (cid.Cid, error) {
+type readCounter struct {
+	r     io.Reader
+	count int64
+}
+
+func (r *readCounter) Read(b []byte) (int, error) {
+	n, err := r.r.Read(b)
+	r.count += int64(n)
+	return n, err
+}
+
+func (nd *Node) fetchNftData(ctx context.Context, url string) (*contentFetch, error) {
+	cf, err := nd.contentMemo.Do(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+
+	return cf.(*contentFetch), nil
+}
+
+func (nd *Node) doFetchData(ctx context.Context, url string) (interface{}, error) {
 	if strings.HasPrefix(url, "ipfs://") {
-		url = "https://ipfs.io" + url[6:]
+		if strings.Contains(url, "/ipfs/") {
+			// incorrectly formatted ipfs uri...
+			url = "https://ipfs.io" + url[6:]
+		} else {
+			url = "https://ipfs.io/ipfs/" + url[6:]
+		}
 	}
 
 	resp, err := http.Get(url)
 	if err != nil {
-		return cid.Undef, err
+		return nil, err
 	}
 
 	defer resp.Body.Close()
 
-	spl := chunker.DefaultSplitter(resp.Body)
+	rc := &readCounter{r: resp.Body}
+
+	spl := chunker.DefaultSplitter(rc)
 	ind, err := importer.BuildDagFromReader(nd.Dag, spl)
 	if err != nil {
-		return cid.Undef, err
+		return nil, err
 	}
 
-	return ind.Cid(), nil
+	return &contentFetch{
+		size:      rc.count,
+		outputCid: ind.Cid(),
+	}, nil
 }
 
 func (nft *NiftyInfo) label() string {
 	return nft.Contract + nft.TokenID
 }
 
-func (nd *Node) fetchMeta(nft *NiftyInfo) (*niftyMeta, error) {
-	nd.metaLk.Lock()
-	f, ok := nd.metaMemo[nft.label()]
-	if ok {
-		nd.metaLk.Unlock()
-		<-f.wait
-		return f.meta, f.err
+func (nd *Node) fetchMeta(ctx context.Context, nft *NiftyInfo) (*niftyMeta, error) {
+	res, err := nd.metaMemo.Do(ctx, nft.URI)
+	if err != nil {
+		return nil, err
 	}
-	f = &metaFetch{
-		wait: make(chan struct{}),
-	}
-	nd.metaMemo[nft.label()] = f
-	nd.metaLk.Unlock()
-	defer func() {
-		close(f.wait)
-	}()
 
-	cachePath := filepath.Join(nd.MetaCacheDir, nft.label())
+	return res.(*niftyMeta), nil
+}
+
+func urlToPath(url string) string {
+	return strings.ReplaceAll(url, "/", "-")
+}
+
+func (nd *Node) doFetchMeta(ctx context.Context, url string) (interface{}, error) {
+	label := urlToPath(url)
+	cachePath := filepath.Join(nd.MetaCacheDir, label)
 	data, err := ioutil.ReadFile(cachePath)
 	if err == nil {
 		var m niftyMeta
 		if err := json.Unmarshal(data, &m); err != nil {
 			return nil, err
 		}
-		f.meta = &m
-		return f.meta, nil
+		return &m, nil
 	}
 	if !os.IsNotExist(err) {
 		return nil, err
 	}
-
-	url := nft.URI
 
 	if strings.HasPrefix(url, "ipfs://") {
 		url = "https://ipfs.io" + url[6:]
@@ -500,31 +524,26 @@ func (nd *Node) fetchMeta(nft *NiftyInfo) (*niftyMeta, error) {
 
 	resp, err := http.Get(url)
 	if err != nil {
-		f.err = err
 		return nil, err
 	}
 
 	if resp.StatusCode != 200 {
-		err := fmt.Errorf("metadata fetch request failed: %d %s", resp.StatusCode, resp.Status)
-		f.err = err
-		return nil, err
+		return nil, fmt.Errorf("metadata fetch request failed: %d %s", resp.StatusCode, resp.Status)
 	}
 
 	defer resp.Body.Close()
 
-	var meta niftyMeta
-	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
-		f.err = err
-		return nil, err
-	}
-
-	outdata, err := json.Marshal(meta)
+	md, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
 
-	fmt.Println("meta: ", cachePath, string(outdata))
-	if err := ioutil.WriteFile(cachePath, outdata, 0660); err != nil {
+	var meta niftyMeta
+	if err := json.Unmarshal(md, &meta); err != nil {
+		return nil, err
+	}
+
+	if err := ioutil.WriteFile(cachePath, md, 0660); err != nil {
 		fmt.Println("caching meta result failed: ", err)
 	}
 
@@ -532,16 +551,13 @@ func (nd *Node) fetchMeta(nft *NiftyInfo) (*niftyMeta, error) {
 }
 
 type activeSearch struct {
-	wait  chan struct{}
 	provs []peer.ID
 	have  bool
-	err   error
 }
 
-type metaFetch struct {
-	wait chan struct{}
-	err  error
-	meta *niftyMeta
+type contentFetch struct {
+	size      int64
+	outputCid cid.Cid
 }
 
 type Node struct {
@@ -556,11 +572,11 @@ type Node struct {
 
 	MetaCacheDir string
 
-	memoLk sync.Mutex
-	memo   map[cid.Cid]*activeSearch
+	memo *memo.Memoizer
 
-	metaLk   sync.Mutex
-	metaMemo map[string]*metaFetch
+	metaMemo *memo.Memoizer
+
+	contentMemo *memo.Memoizer
 }
 
 func loadOrInitPeerKey(kf string) (crypto.PrivKey, error) {
@@ -628,14 +644,18 @@ func setup(ctx context.Context, rootdir string) (*Node, error) {
 		return nil, err
 	}
 
-	return &Node{
+	nd := &Node{
 		MetaCacheDir: dir,
 		Dht:          dht,
 		Host:         h,
 		Blockstore:   bstore,
 		Bitswap:      bswap.(*bitswap.Bitswap),
 		Dag:          ds,
-		memo:         make(map[cid.Cid]*activeSearch),
-		metaMemo:     make(map[string]*metaFetch),
-	}, nil
+	}
+
+	nd.memo = memo.NewMemoizer(nd.doIpfsFetch)
+	nd.metaMemo = memo.NewMemoizer(nd.doFetchMeta)
+	nd.contentMemo = memo.NewMemoizer(nd.doFetchData)
+
+	return nd, nil
 }
